@@ -127,6 +127,54 @@ supervisorctl_cmd() {
   fi
 }
 
+# Ensure supervisor is installed, running, and accessible
+check_supervisor_ready() {
+  # 1. Auto-install if not found
+  if ! command -v supervisorctl >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚙️  Supervisor not found. Installing...${NC}"
+    if ! is_root && ! sudo -n true 2>/dev/null; then
+      echo -e "${RED}Error:${NC} Need root/sudo to install Supervisor."
+      return 1
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+      run_sudo_cmd "apt-get install -y supervisor" || { echo -e "${RED}Error:${NC} Failed to install Supervisor."; return 1; }
+    elif command -v yum >/dev/null 2>&1; then
+      run_sudo_cmd "yum install -y supervisor" || { echo -e "${RED}Error:${NC} Failed to install Supervisor."; return 1; }
+    else
+      echo -e "${RED}Error:${NC} Cannot auto-install: unsupported package manager."
+      return 1
+    fi
+    echo -e "${GREEN}✅ Supervisor installed.${NC}"
+  fi
+
+  # 2. Auto-start daemon if not running
+  local status_output
+  status_output=$(supervisorctl_cmd status 2>&1)
+
+  if echo "$status_output" | grep -qiE "refused|no such file|isn't running|cannot connect|socket"; then
+    echo -e "${YELLOW}⚙️  Supervisor daemon is not running. Starting...${NC}"
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service 2>/dev/null | grep -q supervisor; then
+      run_sudo_cmd "systemctl enable supervisor && systemctl start supervisor" \
+        || run_sudo_cmd "service supervisor start" \
+        || { echo -e "${RED}Error:${NC} Failed to start Supervisor daemon."; return 1; }
+    else
+      run_sudo_cmd "service supervisor start" \
+        || { echo -e "${RED}Error:${NC} Failed to start Supervisor daemon."; return 1; }
+    fi
+    sleep 1
+    echo -e "${GREEN}✅ Supervisor daemon started.${NC}"
+  fi
+
+  # 3. Re-check permissions
+  if [ $? -eq 2 ]; then
+    echo -e "${RED}Error:${NC} Insufficient privileges to run supervisorctl."
+    echo -e "${CYAN}💡 Run as root or configure passwordless sudo.${NC}"
+    return 1
+  fi
+
+  return 0
+}
+
 # ---- Domain / project detection ----
 find_laravel_sites_for_user() {
   local user="$1"
@@ -440,9 +488,7 @@ cmd_remove() {
 }
 
 cmd_list() {
-  if ! supervisorctl_cmd status >/dev/null 2>&1; then
-    echo -e "${RED}Error:${NC} cannot run supervisorctl (insufficient privileges)." ; exit 1
-  fi
+  check_supervisor_ready || exit 1
   echo -e "${CYAN}📋 Workers (supervisorctl):${NC}"
   supervisorctl_cmd status | grep -- "-worker" || echo "No workers found."
 }
@@ -458,9 +504,7 @@ cmd_restart() {
 
 cmd_status() {
   local user="$1"
-  if ! supervisorctl_cmd status >/dev/null 2>&1; then
-    echo -e "${RED}Error:${NC} cannot run supervisorctl (insufficient privileges)." ; exit 1
-  fi
+  check_supervisor_ready || exit 1
 
   if [ -n "$user" ]; then
     supervisorctl_cmd status | grep -E "^${user}-worker\b" >/dev/null 2>&1 || { echo -e "${RED}No worker for ${user}.${NC}"; return; }
