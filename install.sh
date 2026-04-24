@@ -52,7 +52,7 @@ for tool in "${TOOLS[@]}"; do
     fi
 
     $SUDO mv "$TMP_FILE" "${INSTALL_DIR}/${tool}"
-    $SUDO chmod +x "${INSTALL_DIR}/${tool}"
+    $SUDO chmod 755 "${INSTALL_DIR}/${tool}"
     echo -e "${GREEN}✅ '${tool}' installed to ${INSTALL_DIR}/${tool}${NC}"
   else
     echo -e "${RED}❌ Failed to download '${tool}' from ${REPO_RAW}/bin/${tool}${NC}"
