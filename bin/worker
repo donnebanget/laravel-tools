@@ -177,12 +177,7 @@ supervisorctl_cmd() {
   if is_root; then
     supervisorctl "$@"
   else
-    if sudo -n true 2>/dev/null; then
-      sudo -n supervisorctl "$@"
-    else
-      echo -e "${RED}Error:${NC} you don't have sudo rights to run supervisorctl (sudo -n not allowed)."
-      return 2
-    fi
+    sudo -n supervisorctl "$@"
   fi
 }
 
@@ -488,13 +483,17 @@ EOF
   echo -e "${CYAN}📁 Ensuring log directory exists...${NC}"
   if is_root; then
     mkdir -p "${project_dir}/storage/logs"
+    touch "$log_out" "$log_err"
     chown -R "${user}":"${user}" "${project_dir}/storage/logs" 2>/dev/null || true
     chmod 755 "${project_dir}/storage/logs" 2>/dev/null || true
+    chmod 644 "$log_out" "$log_err" 2>/dev/null || true
   else
     if sudo -n true 2>/dev/null; then
       sudo -n mkdir -p "${project_dir}/storage/logs"
+      sudo -n touch "$log_out" "$log_err"
       sudo -n chown -R "${user}":"${user}" "${project_dir}/storage/logs" 2>/dev/null || true
       sudo -n chmod 755 "${project_dir}/storage/logs" 2>/dev/null || true
+      sudo -n chmod 644 "$log_out" "$log_err" 2>/dev/null || true
     fi
   fi
 
@@ -656,8 +655,7 @@ cmd_status() {
     [ -n "$domain" ] && validate_name "domain" "$domain"
     local worker_name
     worker_name=$(worker_name_for "$user" "$domain")
-    supervisorctl_cmd status | grep -E "^${worker_name}\b" >/dev/null 2>&1 || { echo -e "${RED}No worker '${worker_name}'.${NC}"; return 1; }
-    lines=$(supervisorctl_cmd status | grep -E "^${worker_name}\b")
+    lines=$(supervisorctl_cmd status "$worker_name" 2>/dev/null) || { echo -e "${RED}No worker '${worker_name}'.${NC}"; return 1; }
   else
     lines=$(supervisorctl_cmd status | grep -- "-worker" || true)
     if [ -z "$lines" ]; then echo "No workers found."; return; fi
