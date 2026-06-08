@@ -4,7 +4,7 @@
 # Credits: ChatGPT (GPT-5) & Claude (Sonnet 4.5)
 # Version: 2.0.0
 
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 RED='\033[0;31m'
