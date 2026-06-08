@@ -4,6 +4,9 @@
 # Credits: ChatGPT (GPT-5) & Claude (Sonnet 4.5)
 # Version: 2.0.0
 
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -12,18 +15,106 @@ NC='\033[0m'
 
 MODE="normal"
 USER_PREFIX=$(whoami)
+FORCE_SYNC=false
+RUN_MIGRATIONS="auto"
+USE_MAINTENANCE="auto"
+PACKAGE_MANAGER="auto"
+WORKER_NAME="${USER_PREFIX}-worker"
+ASSUME_YES=false
+
+validate_bool_auto() {
+  local label="$1"
+  local value="$2"
+  case "$value" in
+    true|false|auto) ;;
+    *) echo -e "${RED}Error:${NC} Invalid ${label} '${value}'. Use true, false, or auto."; exit 1 ;;
+  esac
+}
+
+validate_bool() {
+  local label="$1"
+  local value="$2"
+  case "$value" in
+    true|false) ;;
+    *) echo -e "${RED}Error:${NC} Invalid ${label} '${value}'. Use true or false."; exit 1 ;;
+  esac
+}
+
+validate_package_manager() {
+  case "$PACKAGE_MANAGER" in
+    auto|npm|pnpm|yarn|bun) ;;
+    *) echo -e "${RED}Error:${NC} Invalid package manager '${PACKAGE_MANAGER}'. Use auto, npm, pnpm, yarn, or bun."; exit 1 ;;
+  esac
+}
+
+validate_worker_name() {
+  if ! [[ "$WORKER_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo -e "${RED}Error:${NC} Invalid WORKER_NAME '${WORKER_NAME}'. Use only letters, numbers, dot, underscore, and dash."
+    exit 1
+  fi
+}
+
+load_deployrc() {
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+
+    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      echo -e "${RED}Error:${NC} Invalid .deployrc line: ${line}"
+      exit 1
+    fi
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+
+    case "$key" in
+      FORCE_SYNC) FORCE_SYNC="$value" ;;
+      RUN_MIGRATIONS) RUN_MIGRATIONS="$value" ;;
+      USE_MAINTENANCE) USE_MAINTENANCE="$value" ;;
+      PACKAGE_MANAGER) PACKAGE_MANAGER="$value" ;;
+      WORKER_NAME) WORKER_NAME="$value" ;;
+      *) echo -e "${RED}Error:${NC} Unsupported .deployrc key '${key}'."; exit 1 ;;
+    esac
+  done < ".deployrc"
+}
+
+if [ -f ".deployrc" ]; then
+  load_deployrc
+fi
 
 # Parse arguments
 for arg in "$@"; do
   case $arg in
     --init) MODE="init" ;;
     --update) MODE="update" ;;
+    --force) FORCE_SYNC=true ;;
+    --migrate) RUN_MIGRATIONS=true ;;
+    --no-migrate) RUN_MIGRATIONS=false ;;
+    --maintenance) USE_MAINTENANCE=true ;;
+    --no-maintenance) USE_MAINTENANCE=false ;;
+    --pm=*) PACKAGE_MANAGER="${arg#*=}" ;;
+    --package-manager=*) PACKAGE_MANAGER="${arg#*=}" ;;
+    --yes|-y) ASSUME_YES=true ;;
     --help) 
       echo "Usage: deploy [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  --init      First-time deployment with full initialization"
       echo "  --update    Pull from Git and rebuild everything"
+      echo "  --force     Force git sync with reset --hard and clean"
+      echo "  --migrate   Run database migrations"
+      echo "  --no-migrate Skip database migrations"
+      echo "  --maintenance Enable Laravel maintenance mode during deploy"
+      echo "  --no-maintenance Disable Laravel maintenance mode"
+      echo "  --pm=NAME   Use package manager: auto, npm, pnpm, yarn, bun"
+      echo "  --yes       Skip confirmation prompts for destructive actions"
       echo "  --help      Show this help message"
       echo ""
       echo "Without options: Quick optimization (no Git/NPM rebuild)"
@@ -31,6 +122,12 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+validate_bool "FORCE_SYNC" "$FORCE_SYNC"
+validate_bool_auto "RUN_MIGRATIONS" "$RUN_MIGRATIONS"
+validate_bool_auto "USE_MAINTENANCE" "$USE_MAINTENANCE"
+validate_package_manager
+validate_worker_name
 
 echo -e "\n${CYAN}🚀 Starting Laravel Deploy (mode: ${MODE})...${NC}\n"
 
@@ -42,20 +139,42 @@ fi
 
 if [ ! -f ".env" ]; then
   echo -e "${YELLOW}⚠️  Warning: .env file not found!${NC}"
-  read -p "Continue anyway? (y/N): " confirm
+  read -r -p "Continue anyway? (y/N): " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 1
 fi
 
 command -v php >/dev/null 2>&1 || { echo -e "${RED}Error: PHP not found!${NC}"; exit 1; }
 command -v composer >/dev/null 2>&1 || { echo -e "${RED}Error: Composer not found!${NC}"; exit 1; }
 
+APP_ENV="production"
+if [ -f ".env" ]; then
+  APP_ENV=$(grep "^APP_ENV=" .env | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+  [ -z "$APP_ENV" ] && APP_ENV="production"
+fi
+
+MAINTENANCE_ACTIVE=false
+if { [ "$USE_MAINTENANCE" = "true" ] || { [ "$USE_MAINTENANCE" = "auto" ] && [ "$APP_ENV" = "production" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; }; }; then
+  echo -e "${YELLOW}🚧 Enabling maintenance mode...${NC}"
+  php artisan down --retry=60 || { echo -e "${RED}Error: Failed to enable maintenance mode.${NC}"; exit 1; }
+  MAINTENANCE_ACTIVE=true
+fi
+
+finish_deploy() {
+  local exit_code=$?
+  if [ "$MAINTENANCE_ACTIVE" = "true" ]; then
+    echo -e "\n${YELLOW}🚦 Disabling maintenance mode...${NC}"
+    php artisan up || true
+  fi
+  exit "$exit_code"
+}
+trap finish_deploy EXIT
+
 # Git update mode
 if [ "$MODE" = "update" ]; then
   echo -e "${YELLOW}🔄 Updating from Git...${NC}"
   
   # Check for detached HEAD
-  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-  if [ $? -ne 0 ]; then
+  if ! BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); then
     echo -e "${RED}Error: Not a git repository.${NC}"
     exit 1
   fi
@@ -65,13 +184,30 @@ if [ "$MODE" = "update" ]; then
     exit 1
   fi
   
-  git fetch origin "$BRANCH"
-  git reset --hard origin/"$BRANCH"
-  git clean -fd -e public/.well-known/
-  
-  if [ $? -ne 0 ]; then
-    echo -e "${RED}Error: Git pull failed!${NC}"
-    exit 1
+  if [ "$FORCE_SYNC" = "true" ]; then
+    echo -e "${YELLOW}⚠️  Force sync enabled: local changes and untracked files may be removed.${NC}"
+    REMOTE_URL=$(git config --get remote.origin.url || echo "unknown")
+    echo -e "${CYAN}Remote:${NC} ${REMOTE_URL}"
+    echo -e "${CYAN}Branch:${NC} ${BRANCH}"
+    if [ "$ASSUME_YES" != "true" ]; then
+      read -r -p "Continue with git reset --hard and git clean? (y/N): " confirm_force
+      [[ "$confirm_force" != "y" && "$confirm_force" != "Y" ]] && exit 1
+    fi
+    if ! git fetch origin "$BRANCH" || \
+      ! git reset --hard origin/"$BRANCH" || \
+      ! git clean -fd -e public/.well-known/ -e storage/ -e public/storage/ -e .env; then
+      echo -e "${RED}Error: Git update failed!${NC}"
+      exit 1
+    fi
+  else
+    if [ -n "$(git status --porcelain)" ]; then
+      echo -e "${RED}Error: Working tree has local changes. Commit/stash them or use --force.${NC}"
+      exit 1
+    fi
+    if ! git fetch origin "$BRANCH" || ! git pull --ff-only origin "$BRANCH"; then
+      echo -e "${RED}Error: Git update failed!${NC}"
+      exit 1
+    fi
   fi
   
   echo -e "${GREEN}✅ Updated branch '$BRANCH'.${NC}\n"
@@ -80,54 +216,91 @@ fi
 # Composer install
 echo -e "${YELLOW}📦 Installing Composer dependencies...${NC}"
 
-# Check APP_ENV to decide --no-dev flag
-APP_ENV="production"
-if [ -f ".env" ]; then
-  APP_ENV=$(grep "^APP_ENV=" .env | cut -d'=' -f2 | tr -d '"' | tr -d "'")
-fi
-
 if [ "$APP_ENV" = "production" ]; then
-  composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+  if ! composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev; then
+    echo -e "${RED}Error: Composer install failed!${NC}"
+    exit 1
+  fi
 else
-  composer install --no-interaction --prefer-dist --optimize-autoloader
+  if ! composer install --no-interaction --prefer-dist --optimize-autoloader; then
+    echo -e "${RED}Error: Composer install failed!${NC}"
+    exit 1
+  fi
   echo -e "${CYAN}ℹ️  Installed with dev dependencies (APP_ENV=${APP_ENV})${NC}"
-fi
-
-if [ $? -ne 0 ]; then
-  echo -e "${RED}Error: Composer install failed!${NC}"
-  exit 1
 fi
 
 echo -e "${GREEN}✅ Composer done.${NC}\n"
 
-# NPM build (only in update mode or if explicitly needed)
+# Frontend build (only in update mode or if explicitly needed)
 if [ -f "package.json" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; then
-  command -v npm >/dev/null 2>&1 || { echo -e "${YELLOW}⚠️  NPM not found, skipping build.${NC}\n"; }
-  
-  if command -v npm >/dev/null 2>&1; then
-    echo -e "${YELLOW}🧩 Installing NPM packages...${NC}"
-    npm install
-    
-    if [ $? -ne 0 ]; then
-      echo -e "${RED}Error: NPM install failed!${NC}"
+  PM="$PACKAGE_MANAGER"
+  if [ "$PM" = "auto" ]; then
+    if [ -f "pnpm-lock.yaml" ]; then
+      PM="pnpm"
+    elif [ -f "yarn.lock" ]; then
+      PM="yarn"
+    elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then
+      PM="bun"
+    else
+      PM="npm"
+    fi
+  fi
+
+  if ! command -v "$PM" >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️  ${PM} not found, skipping build.${NC}\n"
+  else
+    echo -e "${YELLOW}🧩 Installing frontend packages with ${PM}...${NC}"
+    if ! case "$PM" in
+      npm)
+        if [ -f "package-lock.json" ]; then
+          npm ci
+        else
+          npm install
+        fi
+        ;;
+      pnpm)
+        if [ -f "pnpm-lock.yaml" ]; then
+          pnpm install --frozen-lockfile
+        else
+          pnpm install
+        fi
+        ;;
+      yarn)
+        if [ -f "yarn.lock" ]; then
+          yarn install --frozen-lockfile
+        else
+          yarn install
+        fi
+        ;;
+      bun)
+        if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then
+          bun install --frozen-lockfile
+        else
+          bun install
+        fi
+        ;;
+    esac
+    then
+      echo -e "${RED}Error: ${PM} install failed!${NC}"
       exit 1
     fi
     
-    echo -e "${GREEN}✅ NPM done.${NC}"
+    echo -e "${GREEN}✅ ${PM} install done.${NC}"
     echo -e "\n${YELLOW}⚙️ Building assets...${NC}"
     
     # Smart detection of build script
     if grep -q '"build"' package.json; then
-      npm run build
+      build_cmd="build"
     elif grep -q '"prod"' package.json; then
-      npm run prod
+      build_cmd="prod"
     elif grep -q '"production"' package.json; then
-      npm run production
+      build_cmd="production"
     else
       echo -e "${YELLOW}⚠️  No build/prod/production script found in package.json${NC}"
+      build_cmd=""
     fi
-    
-    if [ $? -ne 0 ]; then
+
+    if [ -n "$build_cmd" ] && ! "$PM" run "$build_cmd"; then
       echo -e "${RED}Error: NPM build failed!${NC}"
       exit 1
     fi
@@ -136,41 +309,85 @@ if [ -f "package.json" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; };
   fi
 else
   if [ ! -f "package.json" ]; then
-    echo -e "${CYAN}ℹ️  Skipping NPM (no package.json).${NC}\n"
+    echo -e "${CYAN}ℹ️  Skipping frontend build (no package.json).${NC}\n"
   else
-    echo -e "${CYAN}ℹ️  Skipping NPM build (not in init/update mode).${NC}\n"
+    echo -e "${CYAN}ℹ️  Skipping frontend build (not in init/update mode).${NC}\n"
   fi
 fi
 
 # Clear caches
 echo -e "${YELLOW}🧹 Clearing caches...${NC}"
-php artisan optimize:clear || true
+if ! php artisan optimize:clear; then
+  echo -e "${RED}Error: Failed to clear Laravel caches.${NC}"
+  exit 1
+fi
 
 # Helper function to check if artisan command exists
+ARTISAN_COMMANDS=$(php artisan list --raw 2>/dev/null | awk '{print $1}')
 has_artisan_cmd() {
-  php artisan list 2>/dev/null | grep -q "$1"
+  echo "$ARTISAN_COMMANDS" | grep -Fxq "$1"
 }
+
+run_optional_artisan() {
+  local cmd="$1"
+  if has_artisan_cmd "$cmd"; then
+    php artisan "$cmd" || echo -e "${YELLOW}⚠️  Optional command failed: php artisan ${cmd}${NC}"
+  fi
+}
+
+run_cache_artisan() {
+  local cmd="$1"
+  if has_artisan_cmd "$cmd"; then
+    php artisan "$cmd" || { echo -e "${RED}Error: Failed to run php artisan ${cmd}.${NC}"; exit 1; }
+  fi
+}
+
+if [ "$RUN_MIGRATIONS" = "true" ] || { [ "$RUN_MIGRATIONS" = "auto" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; }; then
+  echo -e "${YELLOW}🗄️ Running database migrations...${NC}"
+  if [ "$APP_ENV" = "production" ]; then
+    if php artisan migrate --force; then
+      migration_ok=true
+    else
+      migration_ok=false
+    fi
+  else
+    if php artisan migrate; then
+      migration_ok=true
+    else
+      migration_ok=false
+    fi
+  fi
+  if [ "$migration_ok" = "false" ]; then
+    echo -e "${RED}Error: Database migration failed!${NC}"
+    exit 1
+  fi
+fi
+
+if [ "$APP_ENV" = "production" ]; then
+  echo -e "${YELLOW}⚡ Rebuilding Laravel caches...${NC}"
+  run_cache_artisan "config:cache"
+  run_optional_artisan "route:cache"
+  run_cache_artisan "view:cache"
+  run_cache_artisan "event:cache"
+fi
 
 # Mode-specific optimizations
 if [ "$MODE" = "init" ]; then
   echo -e "${YELLOW}🔧 Full Laravel initialization...${NC}"
-  has_artisan_cmd "opcache:clear" && php artisan opcache:clear || true
-  has_artisan_cmd "icons:cache" && php artisan icons:cache || true
+  run_optional_artisan "icons:cache"
   #php artisan optimize || true
-  php artisan storage:link || true
+  php artisan storage:link || { echo -e "${RED}Error: Failed to create storage link.${NC}"; exit 1; }
   echo -e "${GREEN}✅ Init complete.${NC}"
 
 elif [ "$MODE" = "update" ]; then
   echo -e "${YELLOW}🔧 Laravel update tasks...${NC}"
-  has_artisan_cmd "opcache:clear" && php artisan opcache:clear || true
-  has_artisan_cmd "icons:cache" && php artisan icons:cache || true
+  run_optional_artisan "icons:cache"
   #php artisan optimize || true
   echo -e "${GREEN}✅ Update done.${NC}"
 
 else
   echo -e "${YELLOW}⚙️ Quick maintenance...${NC}"
-  has_artisan_cmd "opcache:clear" && php artisan opcache:clear || true
-  has_artisan_cmd "icons:cache" && php artisan icons:cache || true
+  run_optional_artisan "icons:cache"
   #php artisan optimize || true
   echo -e "${GREEN}✅ Maintenance complete.${NC}"
 fi
@@ -179,16 +396,11 @@ fi
 echo -e "\n${YELLOW}🔄 Restarting Supervisor if available...${NC}"
 
 if command -v supervisorctl &>/dev/null; then
-  WORKER_NAME="${USER_PREFIX}-worker"
-  
   # Try to restart directly with sudo -n (passwordless)
   # This will only work if sudoers file was created by 'worker create'
   if sudo -n supervisorctl restart "${WORKER_NAME}" 2>/dev/null; then
     echo -e "${GREEN}✅ Worker '${WORKER_NAME}' restarted.${NC}"
   else
-    # Check exit code to determine the issue
-    EXIT_CODE=$?
-    
     # Try to check status (also needs sudo -n)
     if sudo -n supervisorctl status "${WORKER_NAME}" &>/dev/null; then
       # Worker exists but restart failed (shouldn't happen if status works)
@@ -200,7 +412,7 @@ if command -v supervisorctl &>/dev/null; then
       echo -e "${CYAN}💡 To enable auto-restart on deploy:${NC}"
       echo -e "   1. Login as root or user with sudo"
       echo -e "   2. Run: ${YELLOW}worker create ${USER_PREFIX}${NC}"
-      echo -e "   3. This will setup passwordless restart for this user"
+      echo -e "   3. If the worker uses a domain-specific name, set WORKER_NAME in .deployrc"
     fi
   fi
 else

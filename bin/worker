@@ -1,15 +1,18 @@
 #!/bin/bash
 # =====================================================
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 # Laravel Worker Pro CLI
 # /usr/local/bin/worker
 # Version: 1.1.0 - Multi Control Panel Support
 # =====================================================
 # Features:
 #   worker create [user] [domain?] [queue?]
-#   worker remove [user] [--force]
+#   worker remove [user] [domain?] [--force]
 #   worker list
-#   worker restart [user]
-#   worker status [user?]
+#   worker restart [user] [domain?]
+#   worker status [user?] [domain?]
 #   worker logs [user] [out|err]
 # =====================================================
 # Supported Control Panels:
@@ -23,6 +26,8 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SUPERVISOR_CONF_DIR="/etc/supervisor/conf.d"
+ALLOW_SUPERVISOR_INSTALL=false
+ALLOW_OWNER_MISMATCH=false
 
 # ---- Auto-detect control panel ----
 detect_control_panel() {
@@ -70,15 +75,69 @@ BASE_WEB_ROOT=$(detect_control_panel)
 is_root() { [ "$(id -u)" -eq 0 ]; }
 
 run_sudo_cmd() {
+  local cmd="$1"
+  shift
   if is_root; then
-    eval "$*"
+    "$cmd" "$@"
   else
     if sudo -n true 2>/dev/null; then
-      sudo -n bash -c "$*"
+      sudo -n "$cmd" "$@"
     else
       echo -e "${RED}Error:${NC} This action requires sudo privileges but sudo -n is not allowed for your user."
       return 1
     fi
+  fi
+}
+
+validate_name() {
+  local label="$1"
+  local value="$2"
+  if ! [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo -e "${RED}Error:${NC} Invalid ${label}. Use only letters, numbers, dot, underscore, and dash."
+    exit 1
+  fi
+}
+
+validate_bool_env() {
+  local label="$1"
+  local value="$2"
+  case "$value" in
+    true|false|1|0) ;;
+    *) echo -e "${RED}Error:${NC} Invalid ${label}. Use true, false, 1, or 0."; exit 1 ;;
+  esac
+}
+
+require_user() {
+  local user="$1"
+  if ! id "$user" >/dev/null 2>&1; then
+    echo -e "${RED}Error:${NC} System user '${user}' does not exist."
+    exit 1
+  fi
+}
+
+check_project_owner() {
+  local user="$1"
+  local project_dir="$2"
+  local owner
+  owner=$(stat -c '%U' "$project_dir" 2>/dev/null || stat -f '%Su' "$project_dir" 2>/dev/null || echo "")
+  if [ -z "$owner" ]; then
+    echo -e "${RED}Error:${NC} Cannot determine owner for ${project_dir}."
+    exit 1
+  fi
+  if [ "$owner" != "$user" ] && [ "$ALLOW_OWNER_MISMATCH" != "true" ]; then
+    echo -e "${RED}Error:${NC} Project owner is '${owner}', not '${user}'."
+    echo -e "${CYAN}Use --allow-owner-mismatch only if this is intentional.${NC}"
+    exit 1
+  fi
+}
+
+worker_name_for() {
+  local user="$1"
+  local domain="$2"
+  if [ -n "$domain" ]; then
+    echo "${user}-${domain}-worker" | tr '.' '-'
+  else
+    echo "${user}-worker"
   fi
 }
 
@@ -131,15 +190,19 @@ supervisorctl_cmd() {
 check_supervisor_ready() {
   # 1. Auto-install if not found
   if ! command -v supervisorctl >/dev/null 2>&1; then
+    if [ "$ALLOW_SUPERVISOR_INSTALL" != "true" ]; then
+      echo -e "${RED}Error:${NC} Supervisor not found. Install it first or pass --install-supervisor."
+      return 1
+    fi
     echo -e "${YELLOW}⚙️  Supervisor not found. Installing...${NC}"
     if ! is_root && ! sudo -n true 2>/dev/null; then
       echo -e "${RED}Error:${NC} Need root/sudo to install Supervisor."
       return 1
     fi
     if command -v apt-get >/dev/null 2>&1; then
-      run_sudo_cmd "apt-get install -y supervisor" || { echo -e "${RED}Error:${NC} Failed to install Supervisor."; return 1; }
+      run_sudo_cmd apt-get install -y supervisor || { echo -e "${RED}Error:${NC} Failed to install Supervisor."; return 1; }
     elif command -v yum >/dev/null 2>&1; then
-      run_sudo_cmd "yum install -y supervisor" || { echo -e "${RED}Error:${NC} Failed to install Supervisor."; return 1; }
+      run_sudo_cmd yum install -y supervisor || { echo -e "${RED}Error:${NC} Failed to install Supervisor."; return 1; }
     else
       echo -e "${RED}Error:${NC} Cannot auto-install: unsupported package manager."
       return 1
@@ -154,11 +217,11 @@ check_supervisor_ready() {
   if echo "$status_output" | grep -qiE "refused|no such file|isn't running|cannot connect|socket"; then
     echo -e "${YELLOW}⚙️  Supervisor daemon is not running. Starting...${NC}"
     if command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service 2>/dev/null | grep -q supervisor; then
-      run_sudo_cmd "systemctl enable supervisor && systemctl start supervisor" \
-        || run_sudo_cmd "service supervisor start" \
+      { run_sudo_cmd systemctl enable supervisor && run_sudo_cmd systemctl start supervisor; } \
+        || run_sudo_cmd service supervisor start \
         || { echo -e "${RED}Error:${NC} Failed to start Supervisor daemon."; return 1; }
     else
-      run_sudo_cmd "service supervisor start" \
+      run_sudo_cmd service supervisor start \
         || { echo -e "${RED}Error:${NC} Failed to start Supervisor daemon."; return 1; }
     fi
     sleep 1
@@ -194,16 +257,18 @@ find_laravel_sites_for_user() {
     
     # Check if base itself is a Laravel project
     if [ -f "${base}/artisan" ]; then
-      echo "$(basename "$base")"
+      basename "$base"
       continue
     fi
     
     # Search subdirectories for Laravel projects
     find "$base" -maxdepth 2 -mindepth 1 -name "artisan" -type f 2>/dev/null | while read -r artisan_path; do
       # Get directory containing artisan
-      local project_dir=$(dirname "$artisan_path")
+      local project_dir
+      project_dir=$(dirname "$artisan_path")
       # Get domain name (relative to base)
-      local domain=$(echo "$project_dir" | sed "s|^${base}/||" | sed 's|/.*||')
+      local domain
+      domain=$(echo "$project_dir" | sed "s|^${base}/||" | sed 's|/.*||')
       echo "$domain"
     done
   done | sort -u
@@ -224,7 +289,7 @@ auto_pick_domain_interactive() {
       echo "  [$i] $s"
       i=$((i+1))
     done
-    read -p "Select project number: " sel
+    read -r -p "Select project number: " sel
     if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#sites[@]}" ]; then
       echo -e "${RED}Invalid selection.${NC}"
       return 2
@@ -240,15 +305,18 @@ print_usage() {
   echo ""
   echo -e "${YELLOW}Usage:${NC}"
   echo "  worker create [user] [domain?] [queue?]    Create a new worker"
-  echo "  worker remove [user] [--force]             Remove a worker (with confirmation)"
+  echo "  worker remove [user] [domain?] [--force]   Remove a worker (with confirmation)"
   echo "  worker list                                 List all workers"
-  echo "  worker restart [user]                       Restart a worker"
-  echo "  worker status [user?]                       Show worker status"
+  echo "  worker restart [user] [domain?]             Restart a worker"
+  echo "  worker status [user?] [domain?]             Show worker status"
   echo "  worker logs [user] [out|err]                Tail worker logs"
   echo ""
   echo -e "${YELLOW}Examples:${NC}"
   echo "  worker create john example.com"
+  echo "  worker create john example.com --install-supervisor"
   echo "  worker create john example.com emails"
+  echo "  worker create john example.com emails --allow-owner-mismatch"
+  echo "  worker restart john example.com"
   echo "  worker remove john --force"
   echo "  worker logs john out"
   echo ""
@@ -262,19 +330,47 @@ print_usage() {
   echo -e "${YELLOW}Notes:${NC}"
   echo "  - Logs are stored in: {project}/storage/logs/worker.out.log & worker.err.log"
   echo "  - Worker config auto-detects queue driver and environment from .env"
+  echo "  - Use --install-supervisor to allow automatic Supervisor installation"
+  echo "  - Use --allow-owner-mismatch only for intentional shared ownership setups"
   echo "  - Detected base path: ${BASE_WEB_ROOT}"
 }
 
 cmd_create() {
   local user="$1"
-  local domain="$2"
-  local queue="$3"
+  local domain=""
+  local queue=""
+  shift 2>/dev/null || true
+
+  for arg in "$@"; do
+    case "$arg" in
+      --install-supervisor) ALLOW_SUPERVISOR_INSTALL=true ;;
+      --allow-owner-mismatch) ALLOW_OWNER_MISMATCH=true ;;
+      *)
+        if [ -z "$domain" ]; then
+          domain="$arg"
+        elif [ -z "$queue" ]; then
+          queue="$arg"
+        else
+          echo -e "${RED}Error:${NC} Unknown option '${arg}'."
+          exit 1
+        fi
+        ;;
+    esac
+  done
 
   if [ -z "$user" ]; then print_usage; exit 1; fi
+  validate_name "user" "$user"
+  [ -n "$domain" ] && validate_name "domain" "$domain"
+  [ -n "$queue" ] && validate_name "queue" "$queue"
+  require_user "$user"
+  check_supervisor_ready || exit 1
+  local explicit_domain=false
+  [ -n "$domain" ] && explicit_domain=true
 
   # Detect domain if not provided
   if [ -z "$domain" ]; then
     domain=$(auto_pick_domain_interactive "$user") || { echo -e "${RED}No domain auto-detected for user ${user}.${NC}"; exit 1; }
+    validate_name "domain" "$domain"
     echo -e "${CYAN}🌐 Auto-detected domain:${NC} ${domain}"
   fi
 
@@ -304,8 +400,15 @@ cmd_create() {
     printf '  %s\n' "${paths[@]}"
     exit 1
   fi
+  check_project_owner "$user" "$project_dir"
 
-  local conf_file="${SUPERVISOR_CONF_DIR}/${user}-worker.conf"
+  local worker_name
+  if [ "$explicit_domain" = true ]; then
+    worker_name=$(worker_name_for "$user" "$domain")
+  else
+    worker_name=$(worker_name_for "$user" "")
+  fi
+  local conf_file="${SUPERVISOR_CONF_DIR}/${worker_name}.conf"
   
   # Log files in project storage directory
   local log_out="${project_dir}/storage/logs/worker.out.log"
@@ -317,6 +420,11 @@ cmd_create() {
     detected=$(grep "^QUEUE_CONNECTION=" "${project_dir}/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'")
     [ -n "$detected" ] && driver="$detected"
   fi
+  validate_name "queue connection" "$driver"
+  if [ "$driver" = "sync" ]; then
+    echo -e "${RED}Error:${NC} QUEUE_CONNECTION=sync does not need a queue worker. Use database, redis, sqs, or another async driver."
+    exit 1
+  fi
 
   # Detect environment from .env
   local app_env="production"
@@ -325,18 +433,22 @@ cmd_create() {
     app_env=$(grep "^APP_ENV=" "${project_dir}/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" || echo "production")
     app_debug=$(grep "^APP_DEBUG=" "${project_dir}/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" || echo "false")
   fi
+  [ -z "$app_env" ] && app_env="production"
+  [ -z "$app_debug" ] && app_debug="false"
+  validate_name "APP_ENV" "$app_env"
+  validate_bool_env "APP_DEBUG" "$app_debug"
 
   local cmd="php artisan queue:work ${driver} --sleep=3 --tries=3 --max-time=3600"
   if [ -n "$queue" ]; then
     cmd="${cmd} --queue=${queue}"
   fi
 
-  echo -e "${YELLOW}⚙️  Creating worker for user '${user}' (domain: ${domain})...${NC}"
+  echo -e "${YELLOW}⚙️  Creating worker '${worker_name}' for user '${user}' (domain: ${domain})...${NC}"
   echo -e "${CYAN}   Project path:${NC} ${project_dir}"
 
   # Prepare conf content
   read -r -d '' conf_content <<EOF || true
-[program:${user}-worker]
+[program:${worker_name}]
 command=${cmd}
 directory=${project_dir}
 autostart=true
@@ -388,13 +500,19 @@ EOF
 
   # Reload and start
   reload_supervisor || { echo -e "${YELLOW}⚠️  Could not reload supervisor (insufficient privileges).${NC}"; }
-  supervisorctl_cmd start "${user}-worker" >/dev/null 2>&1 || supervisorctl_cmd restart "${user}-worker" >/dev/null 2>&1
+  supervisorctl_cmd start "${worker_name}" >/dev/null 2>&1 || supervisorctl_cmd restart "${worker_name}" >/dev/null 2>&1
 
   # Create sudoers file for user to allow restart without password
-  local sudoers_file="/etc/sudoers.d/${user}-worker"
+  local sudoers_file="/etc/sudoers.d/${worker_name}"
   echo -e "${CYAN}🔐 Creating sudoers entry for user '${user}'...${NC}"
   
-  local sudoers_content="${user} ALL=(root) NOPASSWD: /usr/bin/supervisorctl restart ${user}-worker, /usr/bin/supervisorctl status ${user}-worker, /usr/bin/supervisorctl stop ${user}-worker, /usr/bin/supervisorctl start ${user}-worker"
+  local supervisorctl_path
+  supervisorctl_path=$(command -v supervisorctl)
+  if [ -z "$supervisorctl_path" ] || [[ "$supervisorctl_path" != /* ]]; then
+    echo -e "${RED}Error:${NC} supervisorctl path is invalid."
+    exit 1
+  fi
+  local sudoers_content="${user} ALL=(root) NOPASSWD: ${supervisorctl_path} restart ${worker_name}, ${supervisorctl_path} status ${worker_name}"
   
   if is_root; then
     echo "$sudoers_content" > "$sudoers_file"
@@ -403,6 +521,14 @@ EOF
     if sudo -n true 2>/dev/null; then
       echo "$sudoers_content" | sudo -n tee "$sudoers_file" >/dev/null
       sudo -n chmod 0440 "$sudoers_file"
+      if command -v visudo >/dev/null 2>&1; then
+        if ! sudo -n visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
+          echo -e "${RED}⚠️  Sudoers syntax error, removing file...${NC}"
+          sudo -n rm -f "$sudoers_file"
+        else
+          echo -e "${GREEN}✅ Sudoers entry created successfully.${NC}"
+        fi
+      fi
     else
       echo -e "${YELLOW}⚠️  Could not create sudoers file (need root access).${NC}"
     fi
@@ -420,7 +546,8 @@ EOF
     fi
   fi
 
-  echo -e "${GREEN}✅ Worker '${user}-worker' created successfully!${NC}"
+  echo -e "${GREEN}✅ Worker '${worker_name}' created successfully!${NC}"
+  echo -e "${CYAN}   Worker:${NC} ${worker_name}"
   echo -e "${CYAN}   Domain:${NC} ${domain}"
   echo -e "${CYAN}   Driver:${NC} ${driver}"
   [ -n "$queue" ] && echo -e "${CYAN}   Queue:${NC} ${queue}"
@@ -433,30 +560,39 @@ cmd_remove() {
   local user="$1"
   shift
   local force=false
+  local domain=""
   
   if [ -z "$user" ]; then print_usage; exit 1; fi
+  validate_name "user" "$user"
   
   # Check for --force flag
   for arg in "$@"; do
-    [ "$arg" = "--force" ] && force=true
+    if [ "$arg" = "--force" ]; then
+      force=true
+    elif [ -z "$domain" ]; then
+      domain="$arg"
+    fi
   done
+  [ -n "$domain" ] && validate_name "domain" "$domain"
+  local worker_name
+  worker_name=$(worker_name_for "$user" "$domain")
   
-  local conf_file="${SUPERVISOR_CONF_DIR}/${user}-worker.conf"
+  local conf_file="${SUPERVISOR_CONF_DIR}/${worker_name}.conf"
   
   # Confirmation prompt unless --force
   if [ "$force" = false ]; then
-    echo -e "${YELLOW}⚠️  This will remove worker '${user}-worker'${NC}"
-    read -p "Are you sure? (y/N): " confirm
+    echo -e "${YELLOW}⚠️  This will remove worker '${worker_name}'${NC}"
+    read -r -p "Are you sure? (y/N): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
       echo "Cancelled."
       exit 0
     fi
   fi
   
-  echo -e "${YELLOW}🗑️  Removing worker for ${user}...${NC}"
+  echo -e "${YELLOW}🗑️  Removing worker ${worker_name}...${NC}"
   
   # Stop worker first
-  supervisorctl_cmd stop "${user}-worker" >/dev/null 2>&1 || true
+  supervisorctl_cmd stop "${worker_name}" >/dev/null 2>&1 || true
   
   # Remove config file
   if is_root; then
@@ -470,7 +606,7 @@ cmd_remove() {
   fi
   
   # Remove sudoers file
-  local sudoers_file="/etc/sudoers.d/${user}-worker"
+  local sudoers_file="/etc/sudoers.d/${worker_name}"
   if [ -f "$sudoers_file" ]; then
     echo -e "${CYAN}🔐 Removing sudoers entry...${NC}"
     if is_root; then
@@ -495,20 +631,33 @@ cmd_list() {
 
 cmd_restart() {
   local user="$1"
+  local domain="$2"
   if [ -z "$user" ]; then print_usage; exit 1; fi
-  echo -e "${YELLOW}🔄 Restarting worker for ${user}...${NC}"
-  supervisorctl_cmd restart "${user}-worker" >/dev/null 2>&1 && \
-    echo -e "${GREEN}✅ Worker restarted.${NC}" || \
+  validate_name "user" "$user"
+  [ -n "$domain" ] && validate_name "domain" "$domain"
+  local worker_name
+  worker_name=$(worker_name_for "$user" "$domain")
+  echo -e "${YELLOW}🔄 Restarting worker ${worker_name}...${NC}"
+  if supervisorctl_cmd restart "${worker_name}" >/dev/null 2>&1; then
+    echo -e "${GREEN}✅ Worker restarted.${NC}"
+  else
     echo -e "${RED}⚠️  Worker not found or failed to restart.${NC}"
+    exit 1
+  fi
 }
 
 cmd_status() {
   local user="$1"
+  local domain="$2"
   check_supervisor_ready || exit 1
 
   if [ -n "$user" ]; then
-    supervisorctl_cmd status | grep -E "^${user}-worker\b" >/dev/null 2>&1 || { echo -e "${RED}No worker for ${user}.${NC}"; return; }
-    lines=$(supervisorctl_cmd status | grep -E "^${user}-worker\b")
+    validate_name "user" "$user"
+    [ -n "$domain" ] && validate_name "domain" "$domain"
+    local worker_name
+    worker_name=$(worker_name_for "$user" "$domain")
+    supervisorctl_cmd status | grep -E "^${worker_name}\b" >/dev/null 2>&1 || { echo -e "${RED}No worker '${worker_name}'.${NC}"; return 1; }
+    lines=$(supervisorctl_cmd status | grep -E "^${worker_name}\b")
   else
     lines=$(supervisorctl_cmd status | grep -- "-worker" || true)
     if [ -z "$lines" ]; then echo "No workers found."; return; fi
@@ -529,16 +678,19 @@ cmd_logs() {
   local user="$1"
   local which="$2"
   if [ -z "$user" ]; then print_usage; exit 1; fi
+  validate_name "user" "$user"
   if [ -z "$which" ]; then
     echo -e "${YELLOW}Choose log: (out/err)${NC}"
-    read -p "Which log [out]: " which
+    read -r -p "Which log [out]: " which
     which=${which:-out}
   fi
   if [[ "$which" != "out" && "$which" != "err" ]]; then
     echo -e "${RED}Invalid option. Choose 'out' or 'err'.${NC}"; exit 1
   fi
 
-  local domain=$(auto_pick_domain_interactive "$user") || { echo -e "${RED}No domain found for user ${user}.${NC}"; exit 1; }
+  local domain
+  domain=$(auto_pick_domain_interactive "$user") || { echo -e "${RED}No domain found for user ${user}.${NC}"; exit 1; }
+  validate_name "domain" "$domain"
 
   # Try different path structures
   local project_dir=""
