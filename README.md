@@ -59,6 +59,8 @@ WORKER_NAME=myuser-worker
 
 `.deployrc` hanya menerima key di atas dan tidak dieksekusi sebagai shell script.
 
+`WORKER_NAME` biasanya tidak perlu diset. `deploy` akan mencoba restart `${user}-worker`, lalu otomatis mencoba `${user}-${domain}-worker` dari nama folder project saat worker dibuat dengan domain eksplisit.
+
 ---
 
 ### `worker` — Laravel Worker Manager
@@ -99,19 +101,16 @@ sudo worker create myuser example.com
 # 2. Masuk ke root project Laravel
 cd /path/to/laravel
 
-# 3. Set worker name untuk auto-restart deploy
-echo 'WORKER_NAME=myuser-example-com-worker' > .deployrc
-
-# 4. Deploy pertama kali
+# 3. Deploy pertama kali
 deploy --init
 
-# 5. Update deployment berikutnya
+# 4. Update deployment berikutnya
 deploy --update
 
-# 6. Cek status worker
+# 5. Cek status worker
 worker status myuser example.com
 
-# 7. Tail log worker
+# 6. Tail log worker
 worker logs myuser out
 ```
 
@@ -121,7 +120,7 @@ worker logs myuser out
 
 Saat `worker create` dijalankan, script otomatis membuat entry di `/etc/sudoers.d/` sehingga user dapat melakukan `restart` worker tanpa password. Ini memungkinkan `deploy` me-restart worker secara otomatis tanpa intervensi manual.
 
-Worker dibuat sebagai `${user}-worker` jika domain auto-detected, atau `${user}-${domain}-worker` jika domain diberikan eksplisit. Untuk project multi-domain, set `WORKER_NAME` di `.deployrc` agar `deploy` me-restart worker yang tepat.
+Worker dibuat sebagai `${user}-worker` jika domain auto-detected, atau `${user}-${domain}-worker` jika domain diberikan eksplisit. `deploy` dapat auto-detect kedua pola tersebut, jadi `.deployrc` hanya dibutuhkan untuk nama worker custom atau setup yang tidak mengikuti nama folder domain.
 
 Sudoers dibatasi hanya untuk `supervisorctl restart` dan `supervisorctl status` pada worker terkait.
 

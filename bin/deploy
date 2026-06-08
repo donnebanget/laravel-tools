@@ -396,13 +396,23 @@ fi
 echo -e "\n${YELLOW}🔄 Restarting Supervisor if available...${NC}"
 
 if command -v supervisorctl &>/dev/null; then
-  # Try to restart directly with sudo -n (passwordless)
-  # This will only work if sudoers file was created by 'worker create'
-  if sudo -n supervisorctl restart "${WORKER_NAME}" 2>/dev/null; then
-    echo -e "${GREEN}✅ Worker '${WORKER_NAME}' restarted.${NC}"
+  RESTART_WORKER_NAME="$WORKER_NAME"
+  if ! sudo -n supervisorctl status "${RESTART_WORKER_NAME}" >/dev/null 2>&1; then
+    PROJECT_DOMAIN=$(basename "$PWD")
+    if [[ "$PROJECT_DOMAIN" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      DOMAIN_WORKER_NAME=$(printf '%s-%s-worker' "$USER_PREFIX" "$PROJECT_DOMAIN" | tr '.' '-')
+      if sudo -n supervisorctl status "${DOMAIN_WORKER_NAME}" >/dev/null 2>&1; then
+        RESTART_WORKER_NAME="$DOMAIN_WORKER_NAME"
+        echo -e "${CYAN}ℹ️  Auto-detected worker '${RESTART_WORKER_NAME}'.${NC}"
+      fi
+    fi
+  fi
+
+  if sudo -n supervisorctl restart "${RESTART_WORKER_NAME}" 2>/dev/null; then
+    echo -e "${GREEN}✅ Worker '${RESTART_WORKER_NAME}' restarted.${NC}"
   else
     # Try to check status (also needs sudo -n)
-    if sudo -n supervisorctl status "${WORKER_NAME}" &>/dev/null; then
+    if sudo -n supervisorctl status "${RESTART_WORKER_NAME}" &>/dev/null; then
       # Worker exists but restart failed (shouldn't happen if status works)
       echo -e "${YELLOW}⚠️  Worker exists but restart failed.${NC}"
     else
@@ -412,7 +422,7 @@ if command -v supervisorctl &>/dev/null; then
       echo -e "${CYAN}💡 To enable auto-restart on deploy:${NC}"
       echo -e "   1. Login as root or user with sudo"
       echo -e "   2. Run: ${YELLOW}worker create ${USER_PREFIX}${NC}"
-      echo -e "   3. If the worker uses a domain-specific name, set WORKER_NAME in .deployrc"
+      echo -e "   3. If this user has multiple workers, set WORKER_NAME in .deployrc"
     fi
   fi
 else
