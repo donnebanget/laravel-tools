@@ -21,6 +21,7 @@ USE_MAINTENANCE="auto"
 PACKAGE_MANAGER="auto"
 WORKER_NAME="${USER_PREFIX}-worker"
 ASSUME_YES=false
+DRY_RUN=false
 
 validate_bool_auto() {
   local label="$1"
@@ -52,6 +53,165 @@ validate_worker_name() {
     echo -e "${RED}Error:${NC} Invalid WORKER_NAME '${WORKER_NAME}'. Use only letters, numbers, dot, underscore, and dash."
     exit 1
   fi
+}
+
+print_dry_run() {
+  local maintenance_will_run=false
+  local migrations_will_run=false
+  local frontend_will_run=false
+  local app_env_value="${APP_ENV:-production}"
+
+  if [ "$USE_MAINTENANCE" = "true" ] || { [ "$USE_MAINTENANCE" = "auto" ] && [ "$APP_ENV" = "production" ] && [ "$MODE" = "update" ]; }; then
+    maintenance_will_run=true
+  fi
+
+  if [ "$RUN_MIGRATIONS" = "true" ] || { [ "$RUN_MIGRATIONS" = "auto" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; }; then
+    migrations_will_run=true
+  fi
+
+  if [ -f "package.json" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; then
+    frontend_will_run=true
+  fi
+
+  if [ ! -f "artisan" ]; then
+    echo -e "${YELLOW}⚠️  Warning: artisan file not found, using placeholder commands.${NC}"
+  fi
+
+  if [ ! -f ".env" ]; then
+    echo -e "${YELLOW}⚠️  Warning: .env file not found!${NC}"
+    echo "[DRY-RUN] Would prompt: Continue anyway? (y/N)"
+  else
+    echo -e "${CYAN}ℹ️  .env file found.${NC}"
+  fi
+
+  echo -e "${YELLOW}📦 Installing Composer dependencies...${NC}"
+  echo "[DRY-RUN] Would run: composer install --no-interaction --prefer-dist --optimize-autoloader${app_env_value:+}"
+  if [ "$app_env_value" = "production" ]; then
+    echo "[DRY-RUN] Would add: --no-dev"
+  else
+    echo -e "${CYAN}ℹ️  Installed with dev dependencies (APP_ENV=${app_env_value:-production})${NC}"
+  fi
+  echo -e "${GREEN}✅ Composer done.${NC}\n"
+
+  if [ "$MODE" = "update" ]; then
+    echo -e "${YELLOW}🔄 Updating from Git...${NC}"
+    echo "[DRY-RUN] Would run: git rev-parse --abbrev-ref HEAD"
+    if [ "$FORCE_SYNC" = "true" ]; then
+      echo -e "${YELLOW}⚠️  Force sync enabled: local changes and untracked files may be removed.${NC}"
+      echo "[DRY-RUN] Would run: git fetch origin <branch>"
+      echo "[DRY-RUN] Would run: git reset --hard origin/<branch>"
+      echo "[DRY-RUN] Would run: git clean -fd -e public/.well-known/ -e storage/ -e public/storage/ -e .env"
+    else
+      echo "[DRY-RUN] Would check for local changes with: git status --porcelain"
+      echo "[DRY-RUN] Would run: git fetch origin <branch>"
+      echo "[DRY-RUN] Would run: git pull --ff-only origin <branch>"
+    fi
+    echo -e "${GREEN}✅ Updated branch '<branch>'.${NC}\n"
+  fi
+
+  if [ "$frontend_will_run" = "true" ]; then
+    echo -e "${YELLOW}🧩 Installing frontend packages with ${PACKAGE_MANAGER}...${NC}"
+    echo "[DRY-RUN] Would auto-detect package manager from lockfile or use ${PACKAGE_MANAGER}"
+    echo "[DRY-RUN] Would run package install command based on lockfile"
+    echo -e "${GREEN}✅ ${PACKAGE_MANAGER} install done.${NC}"
+    echo -e "\n${YELLOW}⚙️ Building assets...${NC}"
+    echo "[DRY-RUN] Would detect build/prod/production script in package.json"
+    echo "[DRY-RUN] Would run: ${PACKAGE_MANAGER} run <build_cmd>"
+    echo -e "${GREEN}✅ Build complete.${NC}\n"
+  else
+    if [ ! -f "package.json" ]; then
+      echo -e "${CYAN}ℹ️  Skipping frontend build (no package.json).${NC}\n"
+    else
+      echo -e "${CYAN}ℹ️  Skipping frontend build (not in init/update mode).${NC}\n"
+    fi
+  fi
+
+  echo -e "${YELLOW}🧹 Clearing caches...${NC}"
+  echo "[DRY-RUN] Would run: php artisan optimize:clear"
+  echo -e "${GREEN}✅ Cache clear complete.${NC}"
+
+  if [ "$migrations_will_run" = "true" ]; then
+    echo -e "${YELLOW}🗄️ Running database migrations...${NC}"
+    if [ "$app_env_value" = "production" ]; then
+      echo "[DRY-RUN] Would run: php artisan migrate --force"
+    else
+      echo "[DRY-RUN] Would run: php artisan migrate"
+    fi
+    echo -e "${GREEN}✅ Migrations complete.${NC}"
+  else
+    echo -e "${CYAN}ℹ️  Skipping database migrations.${NC}"
+  fi
+
+  if [ "$APP_ENV" = "production" ]; then
+    echo -e "${YELLOW}⚡ Rebuilding Laravel caches...${NC}"
+    echo "[DRY-RUN] Would run: php artisan config:cache"
+    echo "[DRY-RUN] Would run: php artisan route:cache"
+    echo "[DRY-RUN] Would run: php artisan view:cache"
+    echo "[DRY-RUN] Would run: php artisan event:cache"
+  else
+    echo -e "${CYAN}ℹ️  Skipping Laravel cache rebuild (APP_ENV is not production).${NC}"
+  fi
+
+  if [ "$MODE" = "init" ]; then
+    echo -e "${YELLOW}🔧 Full Laravel initialization...${NC}"
+    echo "[DRY-RUN] Would run: php artisan icons:cache"
+    echo "[DRY-RUN] Would run: php artisan storage:link"
+    echo -e "${GREEN}✅ Init complete.${NC}"
+  elif [ "$MODE" = "update" ]; then
+    echo -e "${YELLOW}🔧 Laravel update tasks...${NC}"
+    echo "[DRY-RUN] Would run: php artisan icons:cache"
+    echo -e "${GREEN}✅ Update done.${NC}"
+  else
+    echo -e "${YELLOW}⚙️ Quick maintenance...${NC}"
+    echo "[DRY-RUN] Would run: php artisan icons:cache"
+    echo -e "${GREEN}✅ Maintenance complete.${NC}"
+  fi
+
+  echo -e "\n${YELLOW}🔄 Restarting Supervisor if available...${NC}"
+  echo "[DRY-RUN] Would run: supervisorctl status '${WORKER_NAME}'"
+  echo "[DRY-RUN] Would auto-detect '${USER_PREFIX}-<domain>-worker' if '${WORKER_NAME}' is missing"
+  echo "[DRY-RUN] Would run: supervisorctl restart '<worker_name>'"
+  echo -e "${GREEN}✅ Worker '<worker_name>' restarted.${NC}"
+
+  if [ "$maintenance_will_run" = "true" ]; then
+    if [ ! -f ".env" ]; then
+      echo -e "${RED}Error:${NC} Failed to enable maintenance mode."
+      echo -e "${YELLOW}Reason:${NC} Missing .env file. Create it before running deploy --init or deploy --maintenance."
+    elif [ ! -f "vendor/autoload.php" ]; then
+      echo -e "${RED}Error:${NC} Failed to enable maintenance mode."
+      echo -e "${YELLOW}Reason:${NC} Composer dependencies are not installed yet. Run composer install first or let deploy finish the Composer step."
+    elif ! grep -q "^APP_KEY=" .env || [ -z "$(grep '^APP_KEY=' .env | cut -d'=' -f2 | tr -d '"' | tr -d "'")" ]; then
+      echo -e "${RED}Error:${NC} Failed to enable maintenance mode."
+      echo -e "${YELLOW}Reason:${NC} APP_KEY is missing or empty in .env. Generate it with php artisan key:generate before maintenance mode."
+    else
+      echo -e "${YELLOW}🚧 Enabling maintenance mode...${NC}"
+      echo "[DRY-RUN] Would run: php artisan down --retry=60"
+      echo -e "${GREEN}✅ Maintenance mode would be enabled.${NC}"
+    fi
+  else
+    echo -e "${CYAN}ℹ️  Maintenance mode not enabled for this mode or environment.${NC}"
+  fi
+
+  echo -e "\n${GREEN}🎉 Deployment completed successfully!${NC}\n"
+}
+
+maintenance_failure_reason() {
+  if [ ! -f ".env" ]; then
+    echo "Missing .env file. Create it before running deploy --init or deploy --maintenance."
+    return
+  fi
+
+  if [ ! -f "vendor/autoload.php" ]; then
+    echo "Composer dependencies are not installed yet. Run composer install first or let deploy finish the Composer step."
+    return
+  fi
+
+  if ! grep -q "^APP_KEY=" .env || [ -z "$(grep '^APP_KEY=' .env | cut -d'=' -f2 | tr -d '"' | tr -d "'")" ]; then
+    echo "APP_KEY is missing or empty in .env. Generate it with php artisan key:generate before maintenance mode."
+    return
+  fi
+
+  echo "Laravel bootstrapping failed while loading artisan. Check storage/logs/laravel.log and your app service providers."
 }
 
 load_deployrc() {
@@ -102,6 +262,7 @@ for arg in "$@"; do
     --pm=*) PACKAGE_MANAGER="${arg#*=}" ;;
     --package-manager=*) PACKAGE_MANAGER="${arg#*=}" ;;
     --yes|-y) ASSUME_YES=true ;;
+    --dry-run|--simulate) DRY_RUN=true ;;
     --help) 
       echo "Usage: deploy [OPTIONS]"
       echo ""
@@ -115,6 +276,7 @@ for arg in "$@"; do
       echo "  --no-maintenance Disable Laravel maintenance mode"
       echo "  --pm=NAME   Use package manager: auto, npm, pnpm, yarn, bun"
       echo "  --yes       Skip confirmation prompts for destructive actions"
+      echo "  --dry-run   Show what would run without changing anything"
       echo "  --help      Show this help message"
       echo ""
       echo "Without options: Quick optimization (no Git/NPM rebuild)"
@@ -133,8 +295,18 @@ echo -e "\n${CYAN}🚀 Starting Laravel Deploy (mode: ${MODE})...${NC}\n"
 
 # Pre-flight checks
 if [ ! -f "artisan" ]; then
+  if [ "$DRY_RUN" = "true" ]; then
+    print_dry_run
+    exit 0
+  fi
+
   echo -e "${RED}Error:${NC} Must be run from Laravel project root (artisan not found)."
   exit 1
+fi
+
+if [ "$DRY_RUN" = "true" ]; then
+  print_dry_run
+  exit 0
 fi
 
 if [ ! -f ".env" ]; then
@@ -153,9 +325,13 @@ if [ -f ".env" ]; then
 fi
 
 MAINTENANCE_ACTIVE=false
-if { [ "$USE_MAINTENANCE" = "true" ] || { [ "$USE_MAINTENANCE" = "auto" ] && [ "$APP_ENV" = "production" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; }; }; then
+if { [ "$USE_MAINTENANCE" = "true" ] || { [ "$USE_MAINTENANCE" = "auto" ] && [ "$APP_ENV" = "production" ] && [ "$MODE" = "update" ]; }; }; then
   echo -e "${YELLOW}🚧 Enabling maintenance mode...${NC}"
-  php artisan down --retry=60 || { echo -e "${RED}Error: Failed to enable maintenance mode.${NC}"; exit 1; }
+  if ! php artisan down --retry=60; then
+    echo -e "${RED}Error:${NC} Failed to enable maintenance mode."
+    echo -e "${YELLOW}Reason:${NC} $(maintenance_failure_reason)"
+    exit 1
+  fi
   MAINTENANCE_ACTIVE=true
 fi
 

@@ -37,7 +37,7 @@ Jalankan dari root direktori Laravel project.
 - Install Composer dependencies (auto-detect production/dev)
 - Frontend install + build assets dengan auto-detect `npm`/`pnpm`/`yarn`/`bun` (hanya pada `--init` / `--update`)
 - Run database migrations pada `--init` / `--update` (`--force` otomatis untuk production)
-- Enable maintenance mode otomatis saat production `--init` / `--update`
+- Enable maintenance mode otomatis saat production `--update` (bisa dipaksa dengan `--maintenance`)
 - Clear & rebuild Laravel cache untuk production
 - Auto-restart Supervisor worker (jika sudah di-setup)
 
