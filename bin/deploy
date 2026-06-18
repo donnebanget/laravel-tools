@@ -340,6 +340,10 @@ finish_deploy() {
   if [ "$MAINTENANCE_ACTIVE" = "true" ]; then
     echo -e "\n${YELLOW}🚦 Disabling maintenance mode...${NC}"
     php artisan up || true
+    if [ "$APP_ENV" = "production" ]; then
+      echo -e "${YELLOW}🧹 Clearing OPCache...${NC}"
+      run_optional_cache_artisan "opcache:clear"
+    fi
   fi
   exit "$exit_code"
 }
@@ -573,11 +577,6 @@ else
   run_optional_artisan "icons:cache"
   #php artisan optimize || true
   echo -e "${GREEN}✅ Maintenance complete.${NC}"
-fi
-
-if [ "$APP_ENV" = "production" ]; then
-  echo -e "${YELLOW}🧹 Clearing OPCache...${NC}"
-  run_optional_cache_artisan "opcache:clear"
 fi
 
 # Restart Supervisor worker
