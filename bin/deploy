@@ -552,7 +552,6 @@ if [ "$APP_ENV" = "production" ]; then
   run_optional_artisan "route:cache"
   run_cache_artisan "view:cache"
   run_cache_artisan "event:cache"
-  run_optional_cache_artisan "opcache:clear"
 fi
 
 # Mode-specific optimizations
@@ -574,6 +573,11 @@ else
   run_optional_artisan "icons:cache"
   #php artisan optimize || true
   echo -e "${GREEN}✅ Maintenance complete.${NC}"
+fi
+
+if [ "$APP_ENV" = "production" ]; then
+  echo -e "${YELLOW}🧹 Clearing OPCache...${NC}"
+  run_optional_cache_artisan "opcache:clear"
 fi
 
 # Restart Supervisor worker
