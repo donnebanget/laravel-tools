@@ -518,6 +518,13 @@ run_cache_artisan() {
   fi
 }
 
+run_optional_cache_artisan() {
+  local cmd="$1"
+  if has_artisan_cmd "$cmd"; then
+    php artisan "$cmd" || echo -e "${YELLOW}⚠️  Optional cache command failed: php artisan ${cmd}${NC}"
+  fi
+}
+
 if [ "$RUN_MIGRATIONS" = "true" ] || { [ "$RUN_MIGRATIONS" = "auto" ] && { [ "$MODE" = "init" ] || [ "$MODE" = "update" ]; }; }; then
   echo -e "${YELLOW}🗄️ Running database migrations...${NC}"
   if [ "$APP_ENV" = "production" ]; then
@@ -545,6 +552,7 @@ if [ "$APP_ENV" = "production" ]; then
   run_optional_artisan "route:cache"
   run_cache_artisan "view:cache"
   run_cache_artisan "event:cache"
+  run_optional_cache_artisan "opcache:clear"
 fi
 
 # Mode-specific optimizations

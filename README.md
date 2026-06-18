@@ -39,6 +39,7 @@ Jalankan dari root direktori Laravel project.
 - Run database migrations pada `--init` / `--update` (`--force` otomatis untuk production)
 - Enable maintenance mode otomatis saat production `--update` (bisa dipaksa dengan `--maintenance`)
 - Clear & rebuild Laravel cache untuk production
+- Clear OPCache jika command `opcache:clear` tersedia
 - Auto-restart Supervisor worker (jika sudah di-setup)
 
 **Catatan Git update:**
